@@ -7,7 +7,7 @@
 
 ## 📖  Overview
 
-Heavy‑duty trucks underpin modern supply chains, yet unexpected component failures impose significant economic and safety risks. Traditional predictive maintenance focuses on machine‑derived signals only. This project introduces a **behavioral vs technical** paradigm—explicitly modeling both driver behaviors (e.g., harsh braking, acceleration events) and mechanical indicators (e.g., temperature, pressure, vibration) to forecast component failures more accurately and cost‑effectively.
+Heavy‑duty trucks underpin modern supply chains, yet unexpected component failures impose significant economic and safety risks. Traditional predictive maintenance focuses on machine‑derived signals only. This project introduces a **behavioral vs technical** paradigm explicitly modeling both driver behaviors (e.g., harsh braking, acceleration events) and mechanical indicators (e.g., temperature, pressure, vibration) to forecast component failures more accurately and cost‑effectively.
 This project will be furtherly investigated with Sandia labs and georgia tech and might result in a research paper or stronger conclusions.
 ---
 
