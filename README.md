@@ -10,6 +10,7 @@
 Heavy‑duty trucks underpin modern supply chains, yet unexpected component failures impose significant economic and safety risks. Traditional predictive maintenance focuses on machine‑derived signals only. This project introduces a **behavioral vs technical** paradigm explicitly modeling both driver behaviors (e.g., harsh braking, acceleration events) and mechanical indicators (e.g., temperature, pressure, vibration) to forecast component failures more accurately and cost‑effectively.
 This project will be furtherly investigated with Sandia labs and georgia tech and might result in a research paper or stronger conclusions.
 ---
+> 🔒 **Note:**  The code available on this rep is permitted for my portofolio showcase, It isn't the complete pipeline and the project had a lot of research, analysis, preperation and communication with SCANIA and truck drivers to come to results.
 
 ## 🎯 Key Achievements
 
@@ -59,9 +60,6 @@ This project will be furtherly investigated with Sandia labs and georgia tech an
 2. **Driver Coaching Module:** build real‑time feedback system based on behavioral flags  
 3. **Production Deployment:** integrate with SCANIA’s fleet‑management platform  
 
----
-
-> 🔒 **Note:** This repository contains the final analytical report. Proprietary code and raw data are withheld under NDA.
 
 ---
 
