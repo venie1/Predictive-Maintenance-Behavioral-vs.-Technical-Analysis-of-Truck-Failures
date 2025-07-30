@@ -1,0 +1,972 @@
+#!/usr/bin/env python
+# coding: utf-8
+"""
+SCANIA Air Pressure System Failure Prediction Pipeline
+Professional implementation for vehicle failure prediction using sensor data
+"""
+
+# Standard library imports
+import os
+import re
+import warnings
+from datetime import datetime
+
+# Data manipulation and analysis
+import pandas as pd
+import numpy as np
+
+# Visualization
+import matplotlib.pyplot as plt
+import seaborn as sns
+import plotly.express as px
+import plotly.graph_objects as go
+from plotly.subplots import make_subplots
+
+# Statistical analysis
+from scipy import stats
+
+# Machine learning - preprocessing
+from sklearn.preprocessing import StandardScaler
+from sklearn.impute import SimpleImputer, KNNImputer
+from sklearn.compose import ColumnTransformer
+from sklearn.pipeline import Pipeline, make_pipeline
+from sklearn.decomposition import PCA
+
+# Machine learning - models
+from sklearn.linear_model import LogisticRegression
+from sklearn.ensemble import (RandomForestClassifier, GradientBoostingClassifier, 
+                              HistGradientBoostingClassifier)
+from sklearn.neighbors import KNeighborsClassifier
+from sklearn.tree import DecisionTreeClassifier
+from sklearn.naive_bayes import GaussianNB
+from sklearn.neural_network import MLPClassifier
+
+# Machine learning - evaluation
+from sklearn.metrics import (
+    accuracy_score, precision_score, recall_score, f1_score, roc_auc_score, 
+    confusion_matrix, classification_report, roc_curve, auc, 
+    precision_recall_curve, average_precision_score
+)
+from sklearn.model_selection import cross_val_score
+from sklearn.utils import resample
+from sklearn.utils.class_weight import compute_class_weight
+from sklearn.base import clone
+
+# Optional XGBoost
+try:
+    from xgboost import XGBClassifier
+    XGBOOST_AVAILABLE = True
+except ImportError:
+    XGBOOST_AVAILABLE = False
+
+# Configuration
+warnings.filterwarnings('ignore')
+plt.style.use('seaborn-v0_8')
+sns.set_palette("husl")
+
+# Color palette
+COLORS = {
+    'primary': '#2E86AB',
+    'secondary': '#A23B72', 
+    'success': '#F18F01',
+    'warning': '#C73E1D',
+    'healthy': '#10B981',
+    'repair': '#EF4444',
+    'human': '#3B82F6',
+    'mechanical': '#F59E0B'
+}
+
+BASE_PATH = "/kaggle/input/practicum"
+
+class DataLoader:
+    """Handles loading and merging of SCANIA dataset files"""
+    
+    @staticmethod
+    def load_and_merge(base_path, readout_file, spec_file, label_file, id_col="vehicle_id"):
+        """Load and merge operational readouts, specifications, and labels"""
+        df_read = pd.read_csv(f"{base_path}/{readout_file}")
+        df_spec = pd.read_csv(f"{base_path}/{spec_file}")
+        df_lab = pd.read_csv(f"{base_path}/{label_file}")
+        
+        df = df_read.merge(df_spec, on=id_col, how='left')
+        df = df.merge(df_lab, on=id_col, how='left')
+        
+        return df
+    
+    @staticmethod
+    def load_all_datasets(base_path=BASE_PATH):
+        """Load all training, validation, and test datasets"""
+        print("📂 LOADING ALL DATASETS...")
+        
+        train = DataLoader.load_and_merge(base_path, "train_operational_readouts.csv", 
+                                        "train_specifications.csv", "train_tte.csv")
+        val = DataLoader.load_and_merge(base_path, "validation_operational_readouts.csv",
+                                      "validation_specifications.csv", "validation_labels.csv")
+        test = DataLoader.load_and_merge(base_path, "test_operational_readouts.csv",
+                                       "test_specifications.csv", "test_labels.csv")
+        
+        print(f"✓ Training data: {train.shape}")
+        print(f"✓ Validation data: {val.shape}")
+        print(f"✓ Test data: {test.shape}")
+        
+        # Standardize target column names
+        for df, name in [(train, 'train'), (val, 'val'), (test, 'test')]:
+            target_cols = ['in_study_repair', 'class_label', 'target']
+            for col in target_cols:
+                if col in df.columns and col != 'target':
+                    df.rename(columns={col: 'target'}, inplace=True)
+                    break
+        
+        return train, val, test
+
+class FeatureCategorizer:
+    """Categorizes sensor features into psychological vs technical"""
+    
+    PSYCHOLOGICAL_PREFIXES = ["167_", "171_", "291_", "427_", "837_"]
+    TECHNICAL_PREFIXES = ["397_", "459_", "158_", "272_", "370_", "835_", "100_", "666_", "309_"]
+    PSYCHOLOGICAL_KEYWORDS = ['psychological', 'psych', 'mental', 'behavior', 'driver', 'human']
+    TECHNICAL_KEYWORDS = ['technical', 'tech', 'mechanical', 'engine', 'sensor', 'system']
+    
+    @classmethod
+    def categorize_features(cls, df):
+        """Categorize features into psychological, technical, and metadata"""
+        all_columns = df.columns.tolist()
+        metadata_cols = ["vehicle_id", "time_step", "length_of_study_time_step", "target"]
+        metadata_cols += [f"Spec_{i}" for i in range(20)]
+        metadata_cols = [col for col in metadata_cols if col in all_columns]
+        
+        sensor_columns = [col for col in all_columns if col not in metadata_cols]
+        
+        psychological_features = [col for col in sensor_columns 
+                                if any(col.startswith(prefix) for prefix in cls.PSYCHOLOGICAL_PREFIXES)]
+        
+        technical_features = [col for col in sensor_columns 
+                            if any(col.startswith(prefix) for prefix in cls.TECHNICAL_PREFIXES)]
+        
+        uncategorized_features = [col for col in sensor_columns 
+                                if col not in psychological_features + technical_features]
+        
+        return {
+            'psychological': psychological_features,
+            'technical': technical_features, 
+            'uncategorized': uncategorized_features,
+            'metadata': metadata_cols,
+            'all_sensors': sensor_columns
+        }
+
+class VehiclePreprocessor:
+    """Preprocesses vehicle sensor data with configurable strategies"""
+    
+    def __init__(self, missing_threshold=0.7, variance_threshold=0.001):
+        self.missing_threshold = missing_threshold
+        self.variance_threshold = variance_threshold
+        self.features_to_keep = None
+        self.train_feature_categories = None
+        self.outlier_bounds = {}
+        self.cumulative_prefixes = ["427_", "835_", "100_"]
+        self.is_fitted = False
+    
+    def fit(self, df_train):
+        """Learn preprocessing parameters from training data"""
+        print("🎓 FITTING PREPROCESSOR ON TRAINING DATA...")
+        
+        self.train_feature_categories = FeatureCategorizer.categorize_features(df_train)
+        all_sensors = self.train_feature_categories['all_sensors']
+        
+        # Identify features to keep based on missing rate
+        missing_rates = df_train[all_sensors].isnull().mean()
+        high_missing = missing_rates[missing_rates > self.missing_threshold].index.tolist()
+        self.features_to_keep = [col for col in all_sensors if col not in high_missing]
+        print(f"✓ Will keep {len(self.features_to_keep)} features (removed {len(high_missing)} high-missing)")
+        
+        # Remove low variance features
+        df_temp = self._apply_basic_cleaning(df_train.copy())
+        sensor_variances = df_temp[self.features_to_keep].var()
+        low_var_sensors = sensor_variances[sensor_variances < self.variance_threshold].index.tolist()
+        self.features_to_keep = [col for col in self.features_to_keep if col not in low_var_sensors]
+        print(f"✓ Will keep {len(self.features_to_keep)} features (removed {len(low_var_sensors)} low-variance)")
+        
+        # Learn outlier bounds
+        for col in self.features_to_keep:
+            if df_temp[col].dtype in ['float64', 'int64']:
+                q01, q99 = df_temp[col].quantile([0.01, 0.99])
+                self.outlier_bounds[col] = (q01, q99)
+        
+        self.is_fitted = True
+        print("✅ PREPROCESSOR FITTED SUCCESSFULLY")
+        return self
+    
+    def _apply_basic_cleaning(self, df):
+        """Apply basic cleaning operations"""
+        df = df.sort_values(['vehicle_id', 'time_step'])
+        
+        # Convert cumulative features to rates
+        for prefix in self.cumulative_prefixes:
+            cum_cols = [col for col in self.features_to_keep if col.startswith(prefix)]
+            if cum_cols:
+                df[cum_cols] = df.groupby('vehicle_id')[cum_cols].diff().fillna(0)
+        
+        # Fill missing values
+        df[self.features_to_keep] = (df.groupby('vehicle_id')[self.features_to_keep]
+                                   .fillna(method='ffill')
+                                   .fillna(method='bfill')
+                                   .fillna(0))
+        return df
+    
+    def transform(self, df, dataset_name=""):
+        """Transform dataset using fitted parameters"""
+        if not self.is_fitted:
+            raise ValueError("Preprocessor must be fitted before transform!")
+        
+        print(f"🔄 TRANSFORMING {dataset_name.upper()} DATASET...")
+        
+        df_clean = df.copy()
+        current_feature_categories = FeatureCategorizer.categorize_features(df_clean)
+        available_features = [col for col in self.features_to_keep if col in df_clean.columns]
+        metadata_cols = current_feature_categories['metadata']
+        
+        columns_to_keep = metadata_cols + available_features
+        df_clean = df_clean[columns_to_keep]
+        df_clean = self._apply_basic_cleaning(df_clean)
+        
+        # Apply outlier bounds
+        for col, (q01, q99) in self.outlier_bounds.items():
+            if col in df_clean.columns:
+                df_clean[col] = df_clean[col].clip(q01, q99)
+        
+        print(f"✅ {dataset_name.upper()} DATASET TRANSFORMED")
+        return df_clean, available_features
+    
+    def fit_transform(self, df_train):
+        """Fit and transform training data"""
+        self.fit(df_train)
+        return self.transform(df_train, "TRAINING")
+
+class VehicleFeatureEngineer:
+    """Creates vehicle-level aggregated features"""
+    
+    def __init__(self):
+        self.train_feature_categories = None
+        self.is_fitted = False
+    
+    def fit(self, preprocessor):
+        """Learn feature engineering from preprocessor"""
+        self.train_feature_categories = preprocessor.train_feature_categories
+        self.is_fitted = True
+        return self
+    
+    def transform(self, df_clean, available_features, dataset_name=""):
+        """Create vehicle-level features"""
+        if not self.is_fitted:
+            raise ValueError("FeatureEngineer must be fitted before transform!")
+        
+        print(f"🔧 CREATING VEHICLE FEATURES FOR {dataset_name.upper()}...")
+        
+        psych_features = [f for f in self.train_feature_categories['psychological'] 
+                         if f in available_features]
+        tech_features = [f for f in self.train_feature_categories['technical'] 
+                        if f in available_features]
+        
+        # Basic aggregations
+        vehicle_agg = df_clean.groupby('vehicle_id')[available_features].agg([
+            'mean', 'std', 'max', 'min', lambda x: x.iloc[-1]
+        ])
+        vehicle_agg.columns = [f"{col[0]}_{col[1] if col[1] != '<lambda>' else 'final'}" 
+                              for col in vehicle_agg.columns]
+        
+        # Psychological features summary
+        if psych_features:
+            psych_mean_cols = [f"{col}_mean" for col in psych_features]
+            psych_std_cols = [f"{col}_std" for col in psych_features]
+            
+            vehicle_agg['psychological_mean_overall'] = vehicle_agg[psych_mean_cols].mean(axis=1)
+            vehicle_agg['psychological_variability'] = vehicle_agg[psych_std_cols].mean(axis=1)
+            vehicle_agg['psychological_intensity'] = vehicle_agg[[f"{col}_max" for col in psych_features]].mean(axis=1)
+        
+        # Technical features summary
+        if tech_features:
+            tech_mean_cols = [f"{col}_mean" for col in tech_features]
+            tech_std_cols = [f"{col}_std" for col in tech_features]
+            
+            vehicle_agg['technical_mean_overall'] = vehicle_agg[tech_mean_cols].mean(axis=1)
+            vehicle_agg['technical_degradation'] = vehicle_agg[tech_std_cols].mean(axis=1)
+            vehicle_agg['technical_peak_stress'] = vehicle_agg[[f"{col}_max" for col in tech_features]].mean(axis=1)
+        
+        # Interaction features
+        if psych_features and tech_features:
+            vehicle_agg['psych_tech_ratio'] = (vehicle_agg['psychological_mean_overall'] / 
+                                              (vehicle_agg['technical_mean_overall'] + 1e-8))
+            vehicle_agg['usage_vs_condition'] = (vehicle_agg['psychological_intensity'] / 
+                                                (vehicle_agg['technical_peak_stress'] + 1e-8))
+        
+        # Add target if available
+        if 'target' in df_clean.columns:
+            vehicle_agg = vehicle_agg.join(df_clean.groupby('vehicle_id')['target'].first())
+        
+        print(f"✅ Created {vehicle_agg.shape[1]} vehicle-level features for {dataset_name.upper()}")
+        return vehicle_agg
+
+class CostSensitiveAnalyzer:
+    """Handles cost-sensitive analysis for SCANIA use case"""
+    
+    @staticmethod
+    def scania_cost_function(y_true, y_pred, cost_fp=100, cost_fn=3500):
+        """Calculate SCANIA-specific costs"""
+        tn = np.sum((y_true == 0) & (y_pred == 0))
+        fp = np.sum((y_true == 0) & (y_pred == 1))
+        fn = np.sum((y_true == 1) & (y_pred == 0))
+        tp = np.sum((y_true == 1) & (y_pred == 1))
+        
+        fp_cost = fp * cost_fp
+        fn_cost = fn * cost_fn
+        total_cost = fp_cost + fn_cost
+        
+        return {
+            'total_cost': total_cost,
+            'fp_cost': fp_cost,
+            'fn_cost': fn_cost,
+            'fp_count': fp,
+            'fn_count': fn,
+            'tp_count': tp,
+            'tn_count': tn,
+            'cost_per_sample': total_cost / len(y_true) if len(y_true) > 0 else 0
+        }
+    
+    @staticmethod
+    def find_optimal_threshold(y_true, y_proba, cost_fp=100, cost_fn=3500):
+        """Find threshold that minimizes total cost"""
+        thresholds = np.linspace(0, 1, 101)
+        costs = []
+        
+        for threshold in thresholds:
+            y_pred = (y_proba >= threshold).astype(int)
+            cost_info = CostSensitiveAnalyzer.scania_cost_function(y_true, y_pred, cost_fp, cost_fn)
+            costs.append(cost_info['total_cost'])
+        
+        min_cost_idx = np.argmin(costs)
+        return thresholds[min_cost_idx], costs[min_cost_idx]
+    
+    @staticmethod
+    def calculate_cost_metrics(y_true, y_proba, cost_fp=100, cost_fn=3500):
+        """Calculate comprehensive cost-sensitive metrics"""
+        optimal_threshold, min_cost = CostSensitiveAnalyzer.find_optimal_threshold(
+            y_true, y_proba, cost_fp, cost_fn)
+        
+        y_pred_optimal = (y_proba >= optimal_threshold).astype(int)
+        cost_info_optimal = CostSensitiveAnalyzer.scania_cost_function(
+            y_true, y_pred_optimal, cost_fp, cost_fn)
+        
+        y_pred_default = (y_proba >= 0.5).astype(int)
+        cost_info_default = CostSensitiveAnalyzer.scania_cost_function(
+            y_true, y_pred_default, cost_fp, cost_fn)
+        
+        return {
+            'optimal_threshold': optimal_threshold,
+            'optimal_total_cost': cost_info_optimal['total_cost'],
+            'optimal_cost_per_sample': cost_info_optimal['cost_per_sample'],
+            'optimal_fp_count': cost_info_optimal['fp_count'],
+            'optimal_fn_count': cost_info_optimal['fn_count'],
+            'default_total_cost': cost_info_default['total_cost'],
+            'default_cost_per_sample': cost_info_default['cost_per_sample'],
+            'cost_reduction': cost_info_default['total_cost'] - cost_info_optimal['total_cost'],
+            'cost_reduction_pct': ((cost_info_default['total_cost'] - cost_info_optimal['total_cost']) / 
+                                  cost_info_default['total_cost'] * 100) if cost_info_default['total_cost'] > 0 else 0
+        }
+
+class ModelEvaluator:
+    """Comprehensive model evaluation with cost-sensitive metrics"""
+    
+    @staticmethod
+    def clean_feature_names(feature_names):
+        """Clean feature names for XGBoost compatibility"""
+        cleaned_names = []
+        for name in feature_names:
+            clean_name = str(name)
+            clean_name = re.sub(r'[<>\[\]{}(),.:;!@#$%^&*+=|\\/?~`\'"\\s-]', '_', clean_name)
+            clean_name = re.sub(r'_+', '_', clean_name)
+            clean_name = clean_name.strip('_')
+            
+            if clean_name and clean_name[0].isdigit():
+                clean_name = 'feat_' + clean_name
+            if not clean_name:
+                clean_name = f'feature_{len(cleaned_names)}'
+            
+            cleaned_names.append(clean_name)
+        return cleaned_names
+    
+    @staticmethod
+    def clean_dataframe_columns(df):
+        """Clean DataFrame column names"""
+        df_cleaned = df.copy()
+        df_cleaned.columns = ModelEvaluator.clean_feature_names(df_cleaned.columns)
+        return df_cleaned
+    
+    @staticmethod
+    def get_classifiers():
+        """Get dictionary of classifiers with various configurations"""
+        classifiers = {
+            'Logistic Regression': LogisticRegression(
+                random_state=42, max_iter=1000, class_weight='balanced'
+            ),
+            'Logistic Regression (Cost-Sensitive)': LogisticRegression(
+                random_state=42, max_iter=1000, class_weight={0: 1, 1: 35}
+            ),
+            'Naive Bayes': GaussianNB(),
+            'Decision Tree': DecisionTreeClassifier(
+                random_state=42, max_depth=10, class_weight='balanced'
+            ),
+            'Random Forest': RandomForestClassifier(
+                n_estimators=100, random_state=42, max_depth=10, class_weight='balanced'
+            ),
+            'Random Forest (Cost-Sensitive)': RandomForestClassifier(
+                n_estimators=100, random_state=42, max_depth=10, class_weight={0: 1, 1: 35}
+            ),
+            'Gradient Boosting': GradientBoostingClassifier(
+                n_estimators=100, random_state=42, max_depth=6
+            ),
+            'K-Nearest Neighbors': KNeighborsClassifier(n_neighbors=5),
+            'Neural Network': MLPClassifier(
+                hidden_layer_sizes=(100, 50), random_state=42, max_iter=500
+            ),
+        }
+        
+        if XGBOOST_AVAILABLE:
+            classifiers['XGBoost'] = XGBClassifier(
+                n_estimators=100, random_state=42, max_depth=6, eval_metric='logloss'
+            )
+            classifiers['XGBoost (Cost-Sensitive)'] = XGBClassifier(
+                n_estimators=100, random_state=42, max_depth=6,
+                scale_pos_weight=35, eval_metric='logloss'
+            )
+        
+        return classifiers
+    
+    @staticmethod
+    def evaluate_classifier(clf, X_train, y_train, X_val, y_val, X_test, y_test, 
+                           clf_name, feature_set_name):
+        """Comprehensive classifier evaluation"""
+        if X_train.shape[1] == 0 or X_train.isnull().sum().sum() > 0:
+            return None
+        
+        try:
+            # Clean feature names
+            X_train_clean = ModelEvaluator.clean_dataframe_columns(X_train)
+            X_val_clean = ModelEvaluator.clean_dataframe_columns(X_val)
+            X_test_clean = ModelEvaluator.clean_dataframe_columns(X_test)
+            
+            clf.fit(X_train_clean, y_train)
+            
+            # Predictions
+            train_pred = clf.predict(X_train_clean)
+            val_pred = clf.predict(X_val_clean)
+            test_pred = clf.predict(X_test_clean)
+            
+            # Probabilities
+            if hasattr(clf, 'predict_proba'):
+                train_proba = clf.predict_proba(X_train_clean)[:, 1]
+                val_proba = clf.predict_proba(X_val_clean)[:, 1]
+                test_proba = clf.predict_proba(X_test_clean)[:, 1]
+            else:
+                train_scores = clf.decision_function(X_train_clean)
+                val_scores = clf.decision_function(X_val_clean)
+                test_scores = clf.decision_function(X_test_clean)
+                
+                train_proba = 1 / (1 + np.exp(-train_scores))
+                val_proba = 1 / (1 + np.exp(-val_scores))
+                test_proba = 1 / (1 + np.exp(-test_scores))
+            
+            # Cost metrics
+            train_cost = CostSensitiveAnalyzer.calculate_cost_metrics(y_train, train_proba)
+            val_cost = CostSensitiveAnalyzer.calculate_cost_metrics(y_val, val_proba)
+            test_cost = CostSensitiveAnalyzer.calculate_cost_metrics(y_test, test_proba)
+            
+            # Standard metrics
+            def safe_metric(func, y_true, y_pred, **kwargs):
+                try:
+                    return func(y_true, y_pred, **kwargs)
+                except:
+                    return np.nan
+            
+            results = {
+                'classifier': clf_name,
+                'feature_set': feature_set_name,
+                'n_features': X_train.shape[1],
+                
+                'train_accuracy': safe_metric(accuracy_score, y_train, train_pred),
+                'train_precision': safe_metric(precision_score, y_train, train_pred, average='weighted', zero_division=0),
+                'train_recall': safe_metric(recall_score, y_train, train_pred, average='weighted', zero_division=0),
+                'train_f1': safe_metric(f1_score, y_train, train_pred, average='weighted', zero_division=0),
+                'train_auc': safe_metric(roc_auc_score, y_train, train_proba),
+                'train_optimal_cost': train_cost['optimal_total_cost'],
+                
+                'val_accuracy': safe_metric(accuracy_score, y_val, val_pred),
+                'val_precision': safe_metric(precision_score, y_val, val_pred, average='weighted', zero_division=0),
+                'val_recall': safe_metric(recall_score, y_val, val_pred, average='weighted', zero_division=0),
+                'val_f1': safe_metric(f1_score, y_val, val_pred, average='weighted', zero_division=0),
+                'val_auc': safe_metric(roc_auc_score, y_val, val_proba),
+                'val_optimal_cost': val_cost['optimal_total_cost'],
+                
+                'test_accuracy': safe_metric(accuracy_score, y_test, test_pred),
+                'test_precision': safe_metric(precision_score, y_test, test_pred, average='weighted', zero_division=0),
+                'test_recall': safe_metric(recall_score, y_test, test_pred, average='weighted', zero_division=0),
+                'test_f1': safe_metric(f1_score, y_test, test_pred, average='weighted', zero_division=0),
+                'test_auc': safe_metric(roc_auc_score, y_test, test_proba),
+                'test_optimal_cost': test_cost['optimal_total_cost'],
+                'test_cost_reduction': test_cost['cost_reduction'],
+                'test_cost_reduction_pct': test_cost['cost_reduction_pct'],
+            }
+            
+            return results
+            
+        except Exception as e:
+            print(f"❌ Error with {clf_name} on {feature_set_name}: {str(e)}")
+            return None
+
+class DataPipeline:
+    """Main pipeline orchestrator"""
+    
+    def __init__(self, base_path=BASE_PATH):
+        self.base_path = base_path
+        self.preprocessor = None
+        self.feature_engineer = None
+    
+    def run_complete_pipeline(self):
+        """Execute complete data processing pipeline"""
+        print("🚀 STARTING COMPLETE VEHICLE ANALYSIS PIPELINE")
+        print("=" * 80)
+        
+        # Load data
+        train_raw, val_raw, test_raw = DataLoader.load_all_datasets(self.base_path)
+        
+        # Preprocessing
+        self.preprocessor = VehiclePreprocessor(missing_threshold=0.7, variance_threshold=0.001)
+        train_clean, train_features = self.preprocessor.fit_transform(train_raw)
+        val_clean, val_features = self.preprocessor.transform(val_raw, "VALIDATION")
+        test_clean, test_features = self.preprocessor.transform(test_raw, "TEST")
+        
+        # Feature engineering
+        self.feature_engineer = VehicleFeatureEngineer().fit(self.preprocessor)
+        train_vehicle_features = self.feature_engineer.transform(train_clean, train_features, "TRAINING")
+        val_vehicle_features = self.feature_engineer.transform(val_clean, val_features, "VALIDATION")
+        test_vehicle_features = self.feature_engineer.transform(test_clean, test_features, "TEST")
+        
+        print("\n" + "="*80)
+        print("✅ COMPLETE PIPELINE FINISHED!")
+        print(f"📊 Training features: {train_vehicle_features.shape}")
+        print(f"📊 Validation features: {val_vehicle_features.shape}")
+        print(f"📊 Test features: {test_vehicle_features.shape}")
+        
+        return {
+            'train_raw': train_raw,
+            'val_raw': val_raw,
+            'test_raw': test_raw,
+            'train_clean': train_clean,
+            'val_clean': val_clean,
+            'test_clean': test_clean,
+            'train_features': train_vehicle_features,
+            'val_features': val_vehicle_features,
+            'test_features': test_vehicle_features,
+            'preprocessor': self.preprocessor,
+            'feature_engineer': self.feature_engineer,
+            'available_features': {
+                'train': train_features,
+                'val': val_features,
+                'test': test_features
+            }
+        }
+    
+    def prepare_modeling_data(self, results, imputation_strategy='median', sampling_strategy='auto'):
+        """Prepare data for machine learning with balancing"""
+        print("🚀 PREPARING ENHANCED MODELING DATA...")
+        
+        train_df = results['train_features']
+        val_df = results['val_features']
+        test_df = results['test_features']
+        
+        # Get common features
+        train_feats = set(train_df.columns) - {'target'}
+        val_feats = set(val_df.columns) - {'target'}
+        test_feats = set(test_df.columns) - {'target'}
+        common_feats = sorted(train_feats & val_feats & test_feats)
+        
+        # Extract features and targets
+        X_train = train_df[common_feats].copy()
+        y_train = (train_df['target'].astype(int) > 0).astype(int)
+        X_val = val_df[common_feats].copy()
+        y_val = (val_df['target'].astype(int) > 0).astype(int)
+        X_test = test_df[common_feats].copy()
+        y_test = (test_df['target'].astype(int) > 0).astype(int)
+        
+        # Clean feature names
+        original_feature_names = common_feats.copy()
+        X_train = ModelEvaluator.clean_dataframe_columns(X_train)
+        X_val = ModelEvaluator.clean_dataframe_columns(X_val)
+        X_test = ModelEvaluator.clean_dataframe_columns(X_test)
+        
+        # Preprocessing pipeline
+        if imputation_strategy == 'knn':
+            imputer = KNNImputer(n_neighbors=5)
+        else:
+            imputer = SimpleImputer(strategy='median')
+        
+        preprocessor = Pipeline([
+            ('imputer', imputer),
+            ('scaler', StandardScaler())
+        ])
+        
+        # Fit and transform
+        preprocessor.fit(X_train)
+        X_train_proc = pd.DataFrame(
+            preprocessor.transform(X_train), 
+            columns=X_train.columns, 
+            index=X_train.index
+        )
+        X_val_proc = pd.DataFrame(
+            preprocessor.transform(X_val), 
+            columns=X_val.columns, 
+            index=X_val.index
+        )
+        X_test_proc = pd.DataFrame(
+            preprocessor.transform(X_test), 
+            columns=X_test.columns, 
+            index=X_test.index
+        )
+        
+        # Apply balanced sampling
+        if sampling_strategy != 'none':
+            X_train_proc, y_train = self._upsample_minority(
+                X_train_proc, y_train, sampling_strategy
+            )
+        
+        print(f"✅ Final training class distribution: {y_train.value_counts().to_dict()}")
+        
+        return {
+            'X_train': X_train_proc,
+            'y_train': y_train,
+            'X_val': X_val_proc,
+            'y_val': y_val,
+            'X_test': X_test_proc,
+            'y_test': y_test,
+            'feature_names': X_train_proc.columns.tolist(),
+            'raw_feature_names': original_feature_names,
+            'preprocessor': preprocessor,
+            'imputation_strategy': imputation_strategy
+        }
+    
+    def _upsample_minority(self, X, y, sampling_strategy='auto'):
+        """Balance dataset using upsampling"""
+        df = pd.concat([X, y.rename("target")], axis=1)
+        majority = df[df.target == 0]
+        minority = df[df.target == 1]
+        
+        if sampling_strategy == 'auto':
+            n_samples = len(majority)
+        elif sampling_strategy == 'balanced':
+            n_samples = len(majority) // 2
+        elif isinstance(sampling_strategy, (int, float)):
+            n_samples = int(len(majority) * sampling_strategy)
+        else:
+            n_samples = len(majority)
+        
+        n_samples = min(n_samples, len(majority))
+        
+        minority_up = resample(
+            minority, replace=True, n_samples=n_samples, random_state=42
+        )
+        
+        df_balanced = pd.concat([majority, minority_up])
+        df_balanced = df_balanced.sample(frac=1, random_state=42).reset_index(drop=True)
+        
+        return df_balanced.drop(columns="target"), df_balanced["target"]
+    
+    def prepare_feature_sets(self, modeling_data):
+        """Prepare different feature sets for experimentation"""
+        print("🎯 PREPARING FEATURE SETS...")
+        
+        raw_names = modeling_data['raw_feature_names']
+        clean_names = modeling_data['feature_names']
+        X_train = modeling_data['X_train']
+        X_val = modeling_data['X_val']
+        X_test = modeling_data['X_test']
+        
+        # Classify features
+        psychological_features = []
+        technical_features = []
+        
+        for i, (raw_name, clean_name) in enumerate(zip(raw_names, clean_names)):
+            raw_lower = raw_name.lower()
+            
+            if any(raw_lower.startswith(prefix) for prefix in FeatureCategorizer.PSYCHOLOGICAL_PREFIXES):
+                psychological_features.append(clean_name)
+            elif any(raw_lower.startswith(prefix) for prefix in FeatureCategorizer.TECHNICAL_PREFIXES):
+                technical_features.append(clean_name)
+            elif any(keyword in raw_lower for keyword in FeatureCategorizer.PSYCHOLOGICAL_KEYWORDS):
+                psychological_features.append(clean_name)
+            elif any(keyword in raw_lower for keyword in FeatureCategorizer.TECHNICAL_KEYWORDS):
+                technical_features.append(clean_name)
+            else:
+                # Use variance heuristic
+                try:
+                    feature_data = X_train[clean_name]
+                    var = feature_data.var()
+                    mean = feature_data.mean()
+                    
+                    if var > abs(mean):
+                        technical_features.append(clean_name)
+                    else:
+                        psychological_features.append(clean_name)
+                except:
+                    technical_features.append(clean_name)
+        
+        print(f"✓ Psychological features: {len(psychological_features)}")
+        print(f"✓ Technical features: {len(technical_features)}")
+        
+        # Build feature sets
+        feature_sets = {}
+        
+        if psychological_features:
+            feature_sets['psychological'] = {
+                'features': psychological_features,
+                'X_train': X_train[psychological_features],
+                'X_val': X_val[psychological_features],
+                'X_test': X_test[psychological_features]
+            }
+        
+        if technical_features:
+            feature_sets['technical'] = {
+                'features': technical_features,
+                'X_train': X_train[technical_features],
+                'X_val': X_val[technical_features],
+                'X_test': X_test[technical_features]
+            }
+        
+        feature_sets['combined'] = {
+            'features': clean_names,
+            'X_train': X_train,
+            'X_val': X_val,
+            'X_test': X_test
+        }
+        
+        return feature_sets
+
+class ExperimentRunner:
+    """Runs comprehensive machine learning experiments"""
+    
+    def __init__(self, pipeline):
+        self.pipeline = pipeline
+    
+    def run_experiments(self, results, imputation_strategies=['median'], 
+                       sampling_strategies=['auto']):
+        """Run comprehensive cost-sensitive experiments"""
+        print("🚀 RUNNING ENHANCED COST-SENSITIVE EXPERIMENTS")
+        print("=" * 80)
+        
+        all_results = []
+        
+        for imputation_strategy in imputation_strategies:
+            for sampling_strategy in sampling_strategies:
+                print(f"\n🔧 TESTING: {imputation_strategy.upper()} imputation + {sampling_strategy.upper()} sampling")
+                
+                # Prepare data
+                modeling_data = self.pipeline.prepare_modeling_data(
+                    results, imputation_strategy, sampling_strategy
+                )
+                
+                if modeling_data is None:
+                    continue
+                
+                # Get classifiers and feature sets
+                classifiers = ModelEvaluator.get_classifiers()
+                feature_sets = self.pipeline.prepare_feature_sets(modeling_data)
+                
+                y_train = modeling_data['y_train']  
+                y_val = modeling_data['y_val']
+                y_test = modeling_data['y_test']
+                
+                # Run experiments
+                total_experiments = len(classifiers) * len(feature_sets)
+                experiment_count = 0
+                
+                for feature_set_name, feature_set_data in feature_sets.items():
+                    print(f"\n📂 TESTING {feature_set_name.upper()} FEATURES ({len(feature_set_data['features'])} features)")
+                    
+                    for clf_name, clf in classifiers.items():
+                        experiment_count += 1
+                        print(f"[{experiment_count}/{total_experiments}] Testing {clf_name}...", end=' ')
+                        
+                        clf_copy = clone(clf)
+                        
+                        result = ModelEvaluator.evaluate_classifier(
+                            clf=clf_copy,
+                            X_train=feature_set_data['X_train'],
+                            y_train=y_train,
+                            X_val=feature_set_data['X_val'],
+                            y_val=y_val,
+                            X_test=feature_set_data['X_test'],
+                            y_test=y_test,
+                            clf_name=clf_name,
+                            feature_set_name=feature_set_name
+                        )
+                        
+                        if result:
+                            result['imputation_strategy'] = imputation_strategy
+                            result['sampling_strategy'] = sampling_strategy
+                            all_results.append(result)
+                            print(f"✓ AUC: {result['test_auc']:.3f}, Cost: {result['test_optimal_cost']:.0f}")
+                        else:
+                            print("❌ Failed")
+        
+        if all_results:
+            results_df = pd.DataFrame(all_results)
+            return self.analyze_results(results_df)
+        else:
+            print("\n❌ No successful experiments to analyze")
+            return None
+    
+    def analyze_results(self, results_df):
+        """Analyze and summarize experiment results"""
+        print("\n" + "=" * 80)
+        print("📊 EXPERIMENT RESULTS SUMMARY")
+        print("=" * 80)
+        
+        best_cost_idx = results_df['test_optimal_cost'].idxmin()
+        best_cost_model = results_df.loc[best_cost_idx]
+        best_auc_idx = results_df['test_auc'].idxmax()
+        best_auc_model = results_df.loc[best_auc_idx]
+        
+        print("\n🏆 BEST MODEL BY COST REDUCTION:")
+        print(f"Classifier: {best_cost_model['classifier']}")
+        print(f"Feature Set: {best_cost_model['feature_set']}")
+        print(f"Test Cost: {best_cost_model['test_optimal_cost']:.0f}")
+        print(f"Cost Reduction: {best_cost_model['test_cost_reduction_pct']:.1f}%")
+        
+        print("\n🏆 BEST MODEL BY AUC:")
+        print(f"Classifier: {best_auc_model['classifier']}")
+        print(f"Feature Set: {best_auc_model['feature_set']}")
+        print(f"Test AUC: {best_auc_model['test_auc']:.3f}")
+        print(f"Test Cost: {best_auc_model['test_optimal_cost']:.0f}")
+        
+        # Save results
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        filename = f"experiment_results_{timestamp}.csv"
+        results_df.to_csv(filename, index=False)
+        print(f"\n💾 Results saved to {filename}")
+        
+        return {
+            'results_df': results_df,
+            'best_cost_model': best_cost_model,
+            'best_auc_model': best_auc_model,
+            'filename': filename
+        }
+
+class Visualizer:
+    """Handles visualization of results and analysis"""
+    
+    @staticmethod
+    def create_cost_vs_auc_plot(results_df):
+        """Create scatter plot of cost vs AUC"""
+        plt.figure(figsize=(10, 6))
+        plt.scatter(results_df['test_auc'], results_df['test_optimal_cost'], alpha=0.6)
+        plt.xlabel('Test ROC AUC')
+        plt.ylabel('Test Optimal Cost')
+        plt.title('Test ROC AUC vs. Test Optimal Cost')
+        plt.grid(True)
+        plt.tight_layout()
+        plt.show()
+    
+    @staticmethod
+    def create_cost_reduction_by_classifier(results_df):
+        """Create bar plot of cost reduction by classifier"""
+        avg_cost_reduction = (
+            results_df
+            .groupby('classifier')['test_cost_reduction_pct']
+            .mean()
+            .sort_values(ascending=False)
+        )
+        
+        plt.figure(figsize=(12, 6))
+        avg_cost_reduction.plot(kind='bar')
+        plt.title('Average Test Cost Reduction (%) by Classifier')
+        plt.xlabel('Classifier')
+        plt.ylabel('Average Cost Reduction (%)')
+        plt.xticks(rotation=45, ha='right')
+        plt.grid(axis='y')
+        plt.tight_layout()
+        plt.show()
+    
+    @staticmethod
+    def create_feature_set_comparison(results_df):
+        """Compare performance across feature sets"""
+        summary = results_df.groupby('feature_set').agg(
+            avg_accuracy=('test_accuracy', 'mean'),
+            avg_precision=('test_precision', 'mean'),
+            avg_recall=('test_recall', 'mean'),
+            avg_f1=('test_f1', 'mean'),
+            avg_auc=('test_auc', 'mean'),
+            avg_cost=('test_optimal_cost', 'mean'),
+            avg_cost_reduction_pct=('test_cost_reduction_pct', 'mean')
+        ).reset_index()
+        
+        print("=== Performance by Feature Set ===")
+        print(summary.round(3).to_string(index=False))
+        
+        # Visualize key metrics
+        metrics = ['avg_auc', 'avg_cost_reduction_pct']
+        fig, axes = plt.subplots(1, 2, figsize=(12, 5))
+        
+        for i, metric in enumerate(metrics):
+            axes[i].bar(summary['feature_set'], summary[metric])
+            axes[i].set_title(metric.replace('avg_', 'Average ').replace('_', ' ').title())
+            axes[i].set_xlabel('Feature Set')
+            axes[i].tick_params(axis='x', rotation=45)
+            axes[i].grid(axis='y')
+        
+        plt.tight_layout()
+        plt.show()
+        
+        return summary
+
+def main():
+    """Main execution function"""
+    print("🚀 SCANIA AIR PRESSURE SYSTEM FAILURE PREDICTION")
+    print("=" * 60)
+    
+    # Initialize pipeline
+    pipeline = DataPipeline()
+    
+    # Run complete data processing
+    results = pipeline.run_complete_pipeline()
+    
+    # Run experiments
+    experiment_runner = ExperimentRunner(pipeline)
+    experiment_results = experiment_runner.run_experiments(
+        results,
+        imputation_strategies=['median', 'knn'],
+        sampling_strategies=['auto', 'balanced']
+    )
+    
+    if experiment_results:
+        # Visualize results
+        visualizer = Visualizer()
+        visualizer.create_cost_vs_auc_plot(experiment_results['results_df'])
+        visualizer.create_cost_reduction_by_classifier(experiment_results['results_df'])
+        feature_summary = visualizer.create_feature_set_comparison(experiment_results['results_df'])
+        
+        print("\n" + "=" * 60)
+        print("💡 RECOMMENDATIONS:")
+        print("1. Best cost model for production deployment")
+        print("2. Consider ensemble methods for improved performance")
+        print("3. Implement feature importance analysis")
+        print("4. Analyze failure patterns for interpretability")
+        print("=" * 60)
+        
+        return {
+            'pipeline_results': results,
+            'experiment_results': experiment_results,
+            'feature_summary': feature_summary
+        }
+    
+    return {'pipeline_results': results}
+
+if __name__ == "__main__":
+    final_results = main()
