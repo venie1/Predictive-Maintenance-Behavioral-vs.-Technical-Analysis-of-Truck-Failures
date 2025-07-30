@@ -1,7 +1,7 @@
 #!/usr/bin/env python
 # coding: utf-8
 """
-SCANIA Air Pressure System Failure Prediction Pipeline
+SCANIA Trucks System Failure Prediction Pipeline
 Professional implementation for vehicle failure prediction using sensor data
 """
 
